@@ -4,8 +4,13 @@
 set -eu
 
 err() {
-    echo "\nError: $1.\n" 1>&2
+    printf "\nError: %s.\n" "$1" 1>&2
     exit 1
+}
+
+warn() {
+    printf "\nWarning: %s.\nContinuing with the default...\n" "$1" 1>&2
+    sleep 5
 }
 
 command_exists() {
@@ -33,7 +38,7 @@ in_target_backup() {
 
 configure_sshd() {
     # !isset($sshd_config_backup)
-    [ -z ${sshd_config_backup+1s} ] && in_target_backup /etc/ssh/sshd_config
+    [ -z "${sshd_config_backup+1s}" ] && in_target_backup /etc/ssh/sshd_config
     sshd_config_backup=
     in_target sed -Ei \""s/^#?$1 .+/$1 $2/"\" /etc/ssh/sshd_config
 }
@@ -63,6 +68,16 @@ prompt_password() {
 }
 
 download() {
+    # Set "$http/https/ftp_proxy" with "$mirror_proxy"
+    # only when none of those have ever been set
+    [ -n "$mirror_proxy" ] &&
+    [ -z "${http_proxy+1s}" ] &&
+    [ -z "${https_proxy+1s}" ] &&
+    [ -z "${ftp_proxy+1s}" ] &&
+    export http_proxy="$mirror_proxy" &&
+    export https_proxy="$mirror_proxy" &&
+    export ftp_proxy="$mirror_proxy"
+
     if command_exists wget; then
         wget -O "$2" "$1"
     elif command_exists curl; then
@@ -72,6 +87,26 @@ download() {
     else
         err 'Cannot find "wget", "curl" or "busybox wget" to download files'
     fi
+}
+
+# Set "$mirror_proxy" with "$http/https/ftp_proxy"
+# only when it is empty and one of those is not empty
+set_mirror_proxy() {
+    [ -n "$mirror_proxy" ] && return
+
+    case $mirror_protocol in
+        http)
+            if [ -n "${http_proxy+1s}" ]; then mirror_proxy="$http_proxy"; fi
+            ;;
+        https)
+            if [ -n "${https_proxy+1s}" ]; then mirror_proxy="$https_proxy"; fi
+            ;;
+        ftp)
+            if [ -n "${ftp_proxy+1s}" ]; then mirror_proxy="$ftp_proxy"; fi
+            ;;
+        *)
+            err "Unsupported protocol: $mirror_protocol"
+    esac
 }
 
 set_security_archive() {
@@ -145,8 +180,7 @@ has_cloud_kernel() {
     esac
 
     local tmp; tmp=''; [ "$bpo_kernel" = true ] && tmp='-backports'
-    echo "\nWarning: No cloud kernel is available for $architecture/$suite$tmp.\nContinuing with the default...\n" 1>&2
-    sleep 5
+    warn "No cloud kernel is available for $architecture/$suite$tmp"
 
     return 1
 }
@@ -156,12 +190,12 @@ has_backports() {
         stretch|oldoldstable|buster|oldstable|bullseye|stable|bookworm|testing) return
     esac
 
-    echo "\nWarning: No backports kernel is available for $suite.\nContinuing with the default...\n" 1>&2
-    sleep 5
+    warn "No backports kernel is available for $suite"
 
     return 1
 }
 
+interface=auto
 ip=
 netmask=
 gateway=
@@ -172,6 +206,7 @@ set_debian_version 11
 mirror_protocol=http
 mirror_host=deb.debian.org
 mirror_directory=/debian
+mirror_proxy=
 security_repository=http://security.debian.org/debian-security
 account_setup=true
 username=debian
@@ -193,6 +228,7 @@ install='ca-certificates libpam-systemd'
 upgrade=
 kernel_params=
 bbr=false
+ssh_port=
 hold=false
 power_off=false
 architecture=
@@ -215,6 +251,10 @@ while [ $# -gt 0 ]; do
             mirror_host=mirrors.aliyun.com
             ntp=ntp.aliyun.com
             security_repository=mirror
+            ;;
+        --interface)
+            interface=$2
+            shift
             ;;
         --ip)
             ip=$2
@@ -267,6 +307,13 @@ while [ $# -gt 0 ]; do
         --mirror-directory)
             mirror_directory=${2%/}
             shift
+            ;;
+        --mirror-proxy|--proxy)
+            mirror_proxy=$2
+            shift
+            ;;
+        --reuse-proxy)
+            set_mirror_proxy
             ;;
         --security-repository)
             security_repository=$2
@@ -350,6 +397,10 @@ while [ $# -gt 0 ]; do
         --bbr)
             bbr=true
             ;;
+        --ssh-port)
+            ssh_port=$2
+            shift
+            ;;
         --hold)
             hold=true
             ;;
@@ -429,7 +480,7 @@ elif [ "$network_console" = true ] && [ -z "$authorized_keys_url" ]; then
     prompt_password "Choose a password for the installer user of the SSH network console: "
 fi
 
-$save_preseed << 'EOF'
+$save_preseed << EOF
 # Localization
 
 d-i debian-installer/language string en
@@ -439,7 +490,7 @@ d-i keyboard-configuration/xkb-keymap select us
 
 # Network configuration
 
-d-i netcfg/choose_interface select auto
+d-i netcfg/choose_interface select $interface
 EOF
 
 [ -n "$ip" ] && {
@@ -501,7 +552,7 @@ d-i mirror/country string manual
 d-i mirror/protocol string $mirror_protocol
 d-i mirror/$mirror_protocol/hostname string $mirror_host
 d-i mirror/$mirror_protocol/directory string $mirror_directory
-d-i mirror/$mirror_protocol/proxy string
+d-i mirror/$mirror_protocol/proxy string $mirror_proxy
 d-i mirror/suite string $suite
 EOF
 
@@ -568,6 +619,8 @@ EOF
     fi
 }
 
+[ -n "$ssh_port" ] && configure_sshd Port "$ssh_port"
+
 $save_preseed << EOF
 
 # Clock and time zone setup
@@ -592,7 +645,12 @@ EOF
         echo 'd-i partman/early_command string debconf-set partman-auto/disk "$(list-devices disk | head -n 1)"' | $save_preseed
     fi
 
-    [ "$force_gpt" = true ] && echo 'd-i partman-partitioning/default_label string gpt' | $save_preseed
+    [ "$force_gpt" = true ] && {
+        $save_preseed << 'EOF'
+d-i partman-partitioning/choose_label string gpt
+d-i partman-partitioning/default_label string gpt
+EOF
+    }
 
     echo "d-i partman/default_filesystem string $filesystem" | $save_preseed
 
@@ -633,10 +691,14 @@ EOF
             mountpoint{ / } \
         .
 EOF
-    echo 'd-i partman-auto/choose_recipe select naive' | $save_preseed
+    if [ "$efi" = true ]; then
+        echo 'd-i partman-efi/non_efi_system boolean true' | $save_preseed
+    fi
 
     $save_preseed << 'EOF'
+d-i partman-auto/choose_recipe select naive
 d-i partman-basicfilesystems/no_swap boolean false
+d-i partman-partitioning/confirm_write_new_label boolean true
 d-i partman/choose_partition select finish
 d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
@@ -705,6 +767,7 @@ EOF
 save_grub_cfg='cat'
 [ "$dry_run" = false ] && {
     base_url="$mirror_protocol://$mirror_host$mirror_directory/dists/$suite/main/installer-$architecture/current/images/netboot/debian-installer/$architecture"
+    [ "$suite" = stretch ] && [ "$efi" = true ] && base_url="$mirror_protocol://$mirror_host$mirror_directory/dists/buster/main/installer-$architecture/current/images/netboot/debian-installer/$architecture"
     [ "$daily_d_i" = true ] && base_url="https://d-i.debian.org/daily-images/$architecture/daily/netboot/debian-installer/$architecture"
     firmware_url="https://cdimage.debian.org/cdimage/unofficial/non-free/firmware/$suite/current/firmware.cpio.gz"
 
@@ -715,7 +778,7 @@ save_grub_cfg='cat'
     gzip -d initrd.gz
     # cpio reads a list of file names from the standard input
     echo preseed.cfg | cpio -o -H newc -A -F initrd
-    gzip -9 initrd
+    gzip -1 initrd
 
     mkdir -p /etc/default/grub.d
     tee /etc/default/grub.d/zz-debi.cfg 1>&2 << EOF
@@ -753,9 +816,7 @@ EOF
 
 installer_directory="$boot_directory$installer"
 
-# shellcheck disable=SC2034
-mem=$(grep ^MemTotal: /proc/meminfo | { read -r x y z; echo "$y"; })
-[ $((mem / 1024)) -le 512 ] && kernel_params="$kernel_params lowmem/low=1"
+kernel_params="$kernel_params lowmem/low=1"
 
 initrd="$installer_directory/initrd.gz"
 [ "$firmware" = true ] && initrd="$initrd $installer_directory/firmware.cpio.gz"
@@ -765,6 +826,7 @@ menuentry 'Debian Installer' --id debi {
     insmod part_msdos
     insmod part_gpt
     insmod ext2
+    insmod xfs
     linux $installer_directory/linux$kernel_params
     initrd $initrd
 }
